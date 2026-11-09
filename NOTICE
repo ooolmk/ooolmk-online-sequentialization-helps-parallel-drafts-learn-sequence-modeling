@@ -1,0 +1,16 @@
+Online Hybrid Draft Training for Qwen3-4B-Instruct
+Copyright 2026 The project authors
+
+This product includes software developed by the vLLM project
+(https://github.com/vllm-project/speculators), licensed under the
+Apache License 2.0. Local modifications to speculators v0.7.0.1 are
+described in patches/speculators-v0.7.0.1-local.patch.
+
+The bundled 300k dataset subset is derived from OpenPerfectBlend
+(https://huggingface.co/datasets/HuggingFaceH4/OpenPerfectBlend),
+licensed under the Apache License 2.0. Its constituent datasets are
+licensed under Apache 2.0 or MIT; see the OpenPerfectBlend dataset card
+for the per-source terms.
+
+Evaluation inputs (GSM8K, HumanEval, MT-Bench) retain their original
+upstream licenses.
