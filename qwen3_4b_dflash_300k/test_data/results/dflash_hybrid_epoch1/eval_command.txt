@@ -1,0 +1,37 @@
+{
+  "created_at": "2026-10-30T05:04:00.395203+00:00",
+  "argv": [
+    "$PROJECT/qwen3_4b_dflash_300k/test_data/test_dflash_acceptance.py",
+    "--draft-model",
+    "$PROJECT/qwen3_4b_dflash_300k/online_rl/runs/dflash_hybrid_ddp2/checkpoints/1",
+    "--vllm-python",
+    "$VLLM_PYTHON",
+    "--max-samples",
+    "0",
+    "--seed",
+    "0",
+    "--temperature",
+    "0.0",
+    "--concurrency",
+    "1",
+    "--max-model-len",
+    "8192",
+    "--datasets",
+    "gsm8k",
+    "humaneval",
+    "mt-bench",
+    "--port",
+    "8001",
+    "--output-dir",
+    "$PROJECT/qwen3_4b_dflash_300k/test_data/results/dflash_hybrid_epoch1",
+    "--cuda-visible-devices",
+    "1",
+    "--gpu-memory-utilization",
+    "0.5"
+  ],
+  "vllm_python": "$VLLM_PYTHON",
+  "vllm_version": "0.28.0",
+  "draft_model": "$PROJECT/qwen3_4b_dflash_300k/online_rl/runs/dflash_hybrid_ddp2/checkpoints/1",
+  "tokenizer": "$PROJECT/Qwen3-4B-Instruct"
+}
+$SPECULATORS_PYTHON $PROJECT/qwen3_4b_dflash_300k/test_data/test_dflash_acceptance.py --draft-model $PROJECT/qwen3_4b_dflash_300k/online_rl/runs/dflash_hybrid_ddp2/checkpoints/1 --vllm-python $VLLM_PYTHON --max-samples 0 --seed 0 --temperature 0.0 --concurrency 1 --max-model-len 8192 --datasets gsm8k humaneval mt-bench --port 8001 --output-dir $PROJECT/qwen3_4b_dflash_300k/test_data/results/dflash_hybrid_epoch1 --cuda-visible-devices 1 --gpu-memory-utilization 0.5
