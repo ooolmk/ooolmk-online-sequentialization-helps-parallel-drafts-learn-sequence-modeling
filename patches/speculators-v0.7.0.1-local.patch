@@ -1,0 +1,904 @@
+# Local modifications on top of vllm-project/speculators tag v0.7.0.1
+# Base commit: e22ce547493c4136d2afcde36f2f0e65c973a77a
+# Apply from the speculators repository root:
+#   git checkout v0.7.0.1 && git apply /path/to/speculators-v0.7.0.1-local.patch
+
+diff --git a/scripts/data_generation_offline.py b/scripts/data_generation_offline.py
+index 34a187e..b71ca6a 100644
+--- a/scripts/data_generation_offline.py
++++ b/scripts/data_generation_offline.py
+@@ -233,9 +233,28 @@ async def worker(  # noqa: C901
+                     timeout=request_timeout,
+                     max_retries=max_retries,
+                 )
++            # The API response can arrive a few milliseconds before the
++            # connector's background writer creates its lock/file.  Checking
++            # for the lock only once races with that writer and makes
++            # shutil.move() intermittently fail with FileNotFoundError.
+             lock_path = hidden_states_path + ".lock"
+-            if Path(lock_path).exists():  # noqa: ASYNC240
+-                await wait_for_lock_async(lock_path)
++            deadline = asyncio.get_running_loop().time() + 120
++            while True:
++                if Path(lock_path).exists():  # noqa: ASYNC240
++                    await wait_for_lock_async(lock_path, timeout=120)
++                    # On network/FUSE filesystems the lock close can become
++                    # visible slightly before the newly written data file.
++                    # Keep polling until the actual safetensors path is
++                    # visible instead of moving it immediately.
++                    if Path(hidden_states_path).exists():  # noqa: ASYNC240
++                        break
++                if Path(hidden_states_path).exists():  # noqa: ASYNC240
++                    break
++                if asyncio.get_running_loop().time() >= deadline:
++                    raise TimeoutError(
++                        f"Timed out waiting for hidden states: {hidden_states_path}"
++                    )
++                await asyncio.sleep(0.05)
+ 
+             async with write_semaphore:  # Limit number of active disk writes
+                 await asyncio.to_thread(
+diff --git a/scripts/launch_vllm.py b/scripts/launch_vllm.py
+index 3ab5cca..6f2e108 100644
+--- a/scripts/launch_vllm.py
++++ b/scripts/launch_vllm.py
+@@ -146,7 +146,8 @@ def main():
+     ]
+ 
+     disable_cp_arg = "--no-enable-chunked-prefill"
+-    if disable_cp_arg not in cmd:
++    enable_cp_arg = "--enable-chunked-prefill"
++    if disable_cp_arg not in cmd and enable_cp_arg not in cmd:
+         cmd.append(disable_cp_arg)
+ 
+     print("Running command:")
+diff --git a/scripts/stitch_mtp.py b/scripts/stitch_mtp.py
+index 0b3fd4a..3a68b64 100644
+--- a/scripts/stitch_mtp.py
++++ b/scripts/stitch_mtp.py
+@@ -273,7 +273,19 @@ def stitch(
+             f"  Skipped [yellow]{frozen_count}[/] frozen key(s) (embed_tokens, lm_head)"
+         )
+ 
+-    weights = _unfuse_moe_experts(weights)
++    verifier_index = verifier_path / "model.safetensors.index.json"
++    verifier_uses_fused_moe = False
++    if verifier_index.exists():
++        with verifier_index.open() as f:
++            verifier_weight_map = json.load(f)["weight_map"]
++        verifier_uses_fused_moe = any(
++            key.endswith(".experts.gate_up_proj") for key in verifier_weight_map
++        )
++
++    if verifier_uses_fused_moe:
++        console.print("  Verifier uses fused MoE tensors; keeping finetuned weights fused")
++    else:
++        weights = _unfuse_moe_experts(weights)
+     native_weights = {_remap_key(k): v for k, v in weights.items()}
+     console.print(f"  Remapped [cyan]{len(native_weights)}[/] keys to native format")
+ 
+diff --git a/src/speculators/data_generation/vllm_client.py b/src/speculators/data_generation/vllm_client.py
+index a5c88d4..99b672b 100644
+--- a/src/speculators/data_generation/vllm_client.py
++++ b/src/speculators/data_generation/vllm_client.py
+@@ -141,7 +141,9 @@ async def wait_for_lock_async(lock_path, timeout=10.0, poll_interval=0.1):
+         os.close(fd)
+         raise
+     os.close(fd)
+-    os.remove(lock_path)
++    # On some shared/FUSE filesystems, unlinking the lock can block for a very
++    # long time.  The lock is unique per generated request; leaving it in place
++    # is safe because future readers can acquire the now-unlocked flock.
+ 
+ 
+ def wait_for_lock(lock_path, timeout=10.0, poll_interval=0.1):
+@@ -162,7 +164,7 @@ def wait_for_lock(lock_path, timeout=10.0, poll_interval=0.1):
+         os.close(fd)
+         raise
+     os.close(fd)
+-    os.remove(lock_path)
++    # Keep the lock file on shared/FUSE filesystems; see the async variant above.
+ 
+ 
+ # Models whose chat template appends a trailing EOS on a *closed* final turn that
+diff --git a/src/speculators/models/dflash/core.py b/src/speculators/models/dflash/core.py
+index 71bf32c..39be2d6 100644
+--- a/src/speculators/models/dflash/core.py
++++ b/src/speculators/models/dflash/core.py
+@@ -247,6 +247,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
+             "max_anchors": max_anchors,
+             "per_position_loss_weight": per_position_loss_weight,
+             "dpace_alpha": dpace_alpha,
++            "eal_kl_coef": kwargs.get("eal_kl_coef", 0.0),
+         }
+         return dict(shared), dict(shared)
+ 
+@@ -337,6 +338,10 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
+         device = hidden_states.device
+         total_seq_len = hidden_states.shape[1]
+         num_anchors = kwargs.pop("max_anchors", 3072)
++        # Online EAL only consumes draft logits; the verifier target logits are
++        # an offline-training artifact and would otherwise cost a full
++        # [num_anchors*block_size, vocab] allocation.
++        compute_targets = kwargs.pop("compute_targets", True)
+ 
+         if position_ids is None:
+             position_ids = torch.arange(
+@@ -377,24 +382,28 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
+             anchor_positions, self.block_size
+         )  # shape: [num_anchors*block_size]
+ 
+-        with torch.no_grad():
+-            if anchored_block_indices.numel() < total_seq_len:
+-                target_indices = (
+-                    anchored_block_indices
+-                    if self.config.sample_from_anchor
+-                    else (anchored_block_indices - 1) % total_seq_len
+-                )
+-                targets = self.verifier_lm_head(
+-                    self.verifier_norm(verifier_last_hidden_states[:, target_indices])
+-                )
+-            else:
+-                verifier_logits = self.verifier_lm_head(
+-                    self.verifier_norm(verifier_last_hidden_states)
+-                )
+-                if not self.config.sample_from_anchor:
+-                    verifier_logits = torch.roll(verifier_logits, 1, dims=1)
+-                targets = verifier_logits[:, anchored_block_indices]
+-            # shape: [1, num_anchors*block_size, draft_vocab_size]
++        targets = None
++        if compute_targets:
++            with torch.no_grad():
++                if anchored_block_indices.numel() < total_seq_len:
++                    target_indices = (
++                        anchored_block_indices
++                        if self.config.sample_from_anchor
++                        else (anchored_block_indices - 1) % total_seq_len
++                    )
++                    targets = self.verifier_lm_head(
++                        self.verifier_norm(
++                            verifier_last_hidden_states[:, target_indices]
++                        )
++                    )
++                else:
++                    verifier_logits = self.verifier_lm_head(
++                        self.verifier_norm(verifier_last_hidden_states)
++                    )
++                    if not self.config.sample_from_anchor:
++                        verifier_logits = torch.roll(verifier_logits, 1, dims=1)
++                    targets = verifier_logits[:, anchored_block_indices]
++                # shape: [1, num_anchors*block_size, draft_vocab_size]
+ 
+         for layer_idx, layer in enumerate(self.layers):
+             noise_embedding = layer(
+@@ -429,6 +438,35 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
+ 
+         return hidden, logits, targets, aligned_loss_mask, anchored_block_indices
+ 
++    @conditional_torch_compile
++    def online_backbone_forward(
++        self,
++        hidden_states: torch.Tensor,
++        input_ids: torch.Tensor,
++        loss_mask: torch.Tensor,
++        verifier_last_hidden_states: torch.Tensor,
++        document_ids: torch.Tensor,
++        position_ids: torch.Tensor | None = None,
++        max_anchors: int = 3072,
++    ):
++        """Compiled draft forward for online label generation.
++
++        ``compute_targets=False`` avoids the unused ``[anchors*block, vocab]``
++        verifier target logits.  Keeping this entry point compiled is required:
++        eager flex attention materializes the full ``[Q, KV]`` score matrix,
++        which OOMs at production anchor counts.
++        """
++        return self._backbone_forward(
++            hidden_states,
++            input_ids,
++            loss_mask,
++            verifier_last_hidden_states,
++            document_ids,
++            position_ids,
++            max_anchors=max_anchors,
++            compute_targets=False,
++        )
++
+     @conditional_torch_compile
+     def forward(
+         self,
+@@ -443,6 +481,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
+         max_anchors: int = 3072,
+         per_position_loss_weight: str = "fixed-exp-decay",
+         dpace_alpha: float = 0.5,
++        eal_kl_coef: float = 0.0,
+         **kwargs,
+     ):
+         _, logits, targets, aligned_loss_mask, _ = self._backbone_forward(
+@@ -465,5 +504,6 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
+             per_position_loss_weight=per_position_loss_weight,
+             dpace_alpha=dpace_alpha,
+             sample_from_anchor=self.config.sample_from_anchor,
++            eal_kl_coef=eal_kl_coef,
+         )
+         return None, loss, metrics
+diff --git a/src/speculators/models/dflash/metrics.py b/src/speculators/models/dflash/metrics.py
+index 827db77..394e311 100644
+--- a/src/speculators/models/dflash/metrics.py
++++ b/src/speculators/models/dflash/metrics.py
+@@ -11,6 +11,7 @@ from speculators.models.metrics import (
+     compute_accuracy_multi_step,
+     dflash_loss_decay,
+     dpace_loss_decay,
++    eal_exact_loss,
+     kl_div_loss,
+ )
+ 
+@@ -27,6 +28,7 @@ def compute_metrics(
+     per_position_loss_weight: str = "fixed-exp-decay",
+     dpace_alpha: float = 0.5,
+     sample_from_anchor: bool = False,
++    eal_kl_coef: float = 0.0,
+ ) -> tuple[torch.Tensor, dict]:
+     """Compute loss and accuracy metrics for draft model predictions.
+ 
+@@ -53,26 +55,40 @@ def compute_metrics(
+     pos_idx = torch.arange(seq_len, device=logits.device) % block_size
+     pos_idx = pos_idx.unsqueeze(0)  # shape: [1, T]
+ 
+-    if per_position_loss_weight == "dpace":
+-        decay_fn = partial(
+-            dpace_loss_decay,
+-            loss_mask=loss_mask,
+-            block_size=block_size,
+-            dpace_alpha=dpace_alpha,
++    # eal_exact is block-coupled and cannot go through the per-position
++    # loss path (which would apply fixed decay weights on top of it).
++    is_eal_exact = list(loss_config.keys()) == ["eal_exact"]
++    if is_eal_exact:
++        loss = eal_exact_loss(
++            logits,
++            targets,
++            loss_mask,
++            block_size,
++            sample_from_anchor=sample_from_anchor,
++            kl_coef=eal_kl_coef,
+         )
++        term_losses = {"eal_exact": loss.detach().clone()}
+     else:
+-        decay_fn = partial(
+-            dflash_loss_decay, gamma=gamma, sample_from_anchor=sample_from_anchor
+-        )
++        if per_position_loss_weight == "dpace":
++            decay_fn = partial(
++                dpace_loss_decay,
++                loss_mask=loss_mask,
++                block_size=block_size,
++                dpace_alpha=dpace_alpha,
++            )
++        else:
++            decay_fn = partial(
++                dflash_loss_decay, gamma=gamma, sample_from_anchor=sample_from_anchor
++            )
+ 
+-    loss, term_losses = compound_loss(
+-        logits,
+-        targets,
+-        loss_mask,
+-        pos_idx,
+-        loss_config=loss_config,
+-        decay_fn=decay_fn,
+-    )
++        loss, term_losses = compound_loss(
++            logits,
++            targets,
++            loss_mask,
++            pos_idx,
++            loss_config=loss_config,
++            decay_fn=decay_fn,
++        )
+ 
+     pred_ids = torch.argmax(logits, dim=-1)
+     target_ids = torch.argmax(targets, dim=-1)
+@@ -105,4 +121,35 @@ def compute_metrics(
+         eal = eal + cum
+     metrics["eal_sum"] = eal
+     metrics["eal_total"] = ones.clone()
++
++    if is_eal_exact:
++        # Diagnostics: per-position p(y_greedy) and the implicit gradient
++        # weight (prod of earlier p) * (suffix contribution), detached.
++        n_slots = block_size - start_pos
++        target_ids = torch.argmax(targets, dim=-1)
++        logp = torch.nn.functional.log_softmax(logits, dim=-1, dtype=torch.float32)
++        p = torch.exp(
++            torch.gather(logp, -1, target_ids.unsqueeze(-1)).squeeze(-1)
++        ).detach()
++        p_slots = p.reshape(1, -1, block_size)[:, :, start_pos:]
++        m_slots = loss_mask.reshape(1, -1, block_size)[:, :, start_pos:]
++        n_blocks = p_slots.shape[1]
++        prefix = torch.ones(1, n_blocks, device=logits.device)
++        prefixes = [prefix]
++        for i in range(n_slots - 1):
++            prefix = prefix * p_slots[:, :, i]
++            prefixes.append(prefix)
++        prefixes = torch.stack(prefixes, dim=-1)  # prod of strictly-earlier p
++        runs: list[torch.Tensor] = [None] * n_slots  # type: ignore[list-item]
++        r = torch.ones(1, n_blocks, device=logits.device)
++        for i in reversed(range(n_slots)):
++            runs[i] = r  # suffix contribution: 1 + p_{i+1} + p_{i+1}p_{i+2} + ...
++            r = 1.0 + p_slots[:, :, i] * r
++        w = prefixes * torch.stack(runs, dim=-1).detach()
++        for i in range(n_slots):
++            m = m_slots[:, :, i]
++            metrics[f"pos_p_{i}_sum"] = (p_slots[:, :, i] * m).sum()
++            metrics[f"pos_p_{i}_total"] = m.sum().clamp(min=1.0)
++            metrics[f"pos_w_{i}_sum"] = (w[:, :, i] * m).sum()
++            metrics[f"pos_w_{i}_total"] = m.sum().clamp(min=1.0)
+     return loss, metrics
+diff --git a/src/speculators/models/metrics.py b/src/speculators/models/metrics.py
+index 7710536..be1fab6 100644
+--- a/src/speculators/models/metrics.py
++++ b/src/speculators/models/metrics.py
+@@ -283,6 +283,105 @@ def lk_hybrid_loss(
+     return elementwise_loss  # noqa: RET504
+ 
+ 
++def _draft_token_acceptance(
++    logits: torch.Tensor, targets: torch.Tensor
++) -> torch.Tensor:
++    """Return the target acceptance probability of the draft's greedy token.
++
++    This is the local, offline analogue of the target re-score used by OPD:
++    the token selected by the draft is looked up in both distributions and the
++    rejection-sampling acceptance probability ``min(1, p/q)`` is computed.
++    The result is detached by callers when it is used as a loss weight, so it
++    does not create a non-differentiable argmax path through the objective.
++    """
++    draft_logp = torch.nn.functional.log_softmax(logits, dim=-1, dtype=torch.float32)
++    target_logp = torch.nn.functional.log_softmax(targets, dim=-1, dtype=torch.float32)
++    draft_ids = torch.argmax(logits, dim=-1, keepdim=True)
++    draft_selected = torch.gather(draft_logp, -1, draft_ids).squeeze(-1)
++    target_selected = torch.gather(target_logp, -1, draft_ids).squeeze(-1)
++    ratio = torch.exp((target_selected - draft_selected).clamp(min=-30.0, max=30.0))
++    return ratio.clamp(max=1.0)
++
++
++def opd_loss(
++    logits: torch.Tensor, targets: torch.Tensor
++) -> torch.Tensor:
++    """Acceptance-aware offline OPD surrogate.
++
++    The target distribution is re-scored at the draft greedy token and the
++    resulting acceptance probability up-weights forward KL on rejected draft
++    tokens.  This keeps the dense teacher gradient while making the objective
++    sensitive to the token sequence emitted by the current draft.  It is an
++    offline surrogate because the existing hidden-state corpus does not carry
++    a freshly rolled-out draft prefix.
++    """
++    base = kl_div_loss(logits, targets)
++    acceptance = _draft_token_acceptance(logits, targets).detach()
++    return base * (1.0 + 2.0 * (1.0 - acceptance))
++
++
++def opd_first_error_loss(
++    logits: torch.Tensor, targets: torch.Tensor
++) -> torch.Tensor:
++    """OPD surrogate with first-error position weighting for DFlash blocks.
++
++    For the fixed DFlash block size of eight, positions before the first
++    rejected draft token receive weight 0.25, the first error receives 1.0,
++    and the suffix receives 0.05.  Fully accepted blocks keep weight 1.0.
++    """
++    base = opd_loss(logits, targets)
++    seq_len = logits.shape[1]
++    if seq_len % 8 != 0:
++        return base
++    correct = torch.argmax(logits, dim=-1).eq(torch.argmax(targets, dim=-1))
++    correct = correct.reshape(-1, 8)
++    # DFlash slot 0 is the anchor, not a speculative prediction.
++    rejected = ~correct[:, 1:]
++    has_rejection = rejected.any(dim=-1, keepdim=True)
++    first_error = rejected.to(torch.int64).argmax(dim=-1, keepdim=True)
++    positions = torch.arange(7, device=logits.device).view(1, 7)
++    weighted = torch.where(
++        positions < first_error,
++        torch.full_like(positions, 0.25, dtype=torch.float32),
++        torch.where(
++            positions == first_error,
++            torch.ones_like(positions, dtype=torch.float32),
++            torch.full_like(positions, 0.05, dtype=torch.float32),
++        ),
++    )
++    weighted = torch.where(has_rejection, weighted, torch.ones_like(weighted))
++    # Preserve an unused slot-0 weight for shape alignment; its loss mask is 0.
++    anchor_weight = torch.ones((weighted.shape[0], 1), device=logits.device)
++    return base * torch.cat((anchor_weight, weighted), dim=1).reshape(1, seq_len)
++
++
++def opd_accept_reward_loss(
++    logits: torch.Tensor, targets: torch.Tensor
++) -> torch.Tensor:
++    """OPD plus a differentiable expected accepted-length reward.
++
++    For each draft position, ``sum(min(p, q))`` is the rejection-sampling
++    overlap between target and draft.  The product of overlaps over the
++    accepted prefix is the expected probability of reaching that position.
++    This term therefore gives a direct, dense surrogate for the seven-token
++    DFlash accepted length.  A small coefficient keeps the OPD KL gradient as
++    the main stabilizing signal.  It is not a high-variance REINFORCE update:
++    the target distribution and expected reward are available from the static
++    hidden-state batch.
++    """
++    seq_len = logits.shape[1]
++    if seq_len % 8 != 0:
++        return ce_loss(logits, targets)
++    base = opd_loss(logits, targets)
++    draft_p = torch.nn.functional.softmax(logits, dim=-1, dtype=torch.float32)
++    target_p = torch.nn.functional.softmax(targets, dim=-1, dtype=torch.float32)
++    overlap = torch.minimum(draft_p, target_p).sum(dim=-1)
++    overlap = overlap.reshape(-1, 8)[:, 1:].clamp(min=0.0, max=1.0)
++    expected_eal = torch.cumprod(overlap, dim=-1).sum(dim=-1).mean() / 7.0
++    eal_deficit = 1.0 - expected_eal
++    return base + 0.5 * eal_deficit
++
++
+ def dflash_loss_decay(
+     pos_idx: torch.Tensor, gamma: float, sample_from_anchor: bool = False, **_kwargs
+ ):
+@@ -416,6 +515,93 @@ def nla_loss_fused_or_eager(logits: torch.Tensor, targets: torch.Tensor):
+     return neg_log_acceptance_loss(logits, targets)
+ 
+ 
++def eal_exact_loss(
++    logits: torch.Tensor,  # shape: [1, seq_len, draft_vocab_size]
++    targets: torch.Tensor,  # shape: [1, seq_len, draft_vocab_size]
++    loss_mask: torch.Tensor,  # shape: [1, seq_len]
++    block_size: int = 8,
++    sample_from_anchor: bool = False,
++    kl_coef: float = 0.0,
++) -> torch.Tensor:
++    """Block-level expected accepted length (EAL) loss for DFlash drafting.
++
++    For each valid block, with p_i the draft softmax probability of the
++    target's greedy token y_i at drafted slot i, the loss is
++
++        L_EAL = -(p_1 + p_1 p_2 + ... + p_1 ... p_7) / num_valid_blocks
++
++    Each term prod_{i<=j} p_i is the probability that the first j draft
++    tokens are all accepted, so the objective is the exact expected
++    accepted-prefix length under the parallel-position independence
++    assumption. Position i's gradient is weighted by the probability that
++    all earlier positions are accepted (prefix gating), which gives
++    credit assignment: suffixes after a likely-first-error stop receiving
++    gradient without any hard mask. Only fully valid blocks (all drafted
++    slots in the loss mask) contribute; boundary blocks are dropped.
++
++    When ``kl_coef > 0`` a masked-mean anchor against the target is added.
++    It is computed as per-position CE to the target's greedy token, which has
++    gradients identical to forward KL (the entropy of the target is constant
++    w.r.t. draft parameters) at a fraction of the memory.
++    """
++    batch_size, seq_len, _ = logits.shape
++    if seq_len % block_size != 0:
++        seq_len -= seq_len % block_size
++        logits = logits[:, :seq_len]
++        targets = targets[:, :seq_len]
++        loss_mask = loss_mask[:, :seq_len]
++    start = 0 if sample_from_anchor else 1
++    loss_mask = loss_mask.to(torch.float32)
++
++    target_ids = torch.argmax(targets, dim=-1)
++    draft_logp = torch.nn.functional.log_softmax(
++        logits, dim=-1, dtype=torch.float32
++    )
++    p = torch.exp(
++        torch.gather(draft_logp, -1, target_ids.unsqueeze(-1)).squeeze(-1)
++    )  # shape: [batch, seq_len]
++
++    p_b = p.reshape(batch_size, -1, block_size)[:, :, start:]
++    m_b = loss_mask.reshape(batch_size, -1, block_size)[:, :, start:]
++    block_w = m_b.prod(dim=-1)  # 1.0 only when every drafted slot is valid
++    eal = torch.cumprod(p_b, dim=-1).sum(dim=-1)  # shape: [batch, num_blocks]
++    denom = block_w.sum().clamp(min=1.0)
++    total = -(eal * block_w).sum() / denom
++
++    if kl_coef > 0.0:
++        # Drift anchor. KL(draft || target) = CE(target) - H(target), and
++        # H(target) is constant w.r.t. draft parameters, so a per-position
++        # CE to the target's greedy token yields gradients identical to the
++        # KL anchor. Computed via logsumexp + gather so no full-width fp32
++        # log_softmax / softmax buffers are materialized (the plain
++        # kl_div_loss path adds ~2 x seq_len x vocab x 4 bytes and OOMs on
++        # memory-tight GPUs).
++        mask_sum = loss_mask.sum().clamp(min=1.0)
++        target_ids = torch.argmax(targets, dim=-1)
++        ce_total = torch.zeros((), device=logits.device, dtype=torch.float32)
++        chunk = 4096
++        for s in range(0, seq_len, chunk):
++            e = min(s + chunk, seq_len)
++            lse = torch.logsumexp(logits[:, s:e].to(torch.float32), dim=-1)
++            q_y = torch.gather(
++                logits[:, s:e].to(torch.float32),
++                -1,
++                target_ids[:, s:e].unsqueeze(-1),
++            ).squeeze(-1)
++            ce_total = ce_total + ((lse - q_y) * loss_mask[:, s:e]).sum()
++        total = total + kl_coef * ce_total / mask_sum
++
++    return total
++
++
++def _eal_exact_guard(logits: torch.Tensor, targets: torch.Tensor):
++    raise NotImplementedError(
++        "eal_exact is a block-level objective and cannot be evaluated by the "
++        "per-position loss path. It is handled directly by the DFlash "
++        "compute_metrics special case."
++    )
++
++
+ _LOSS_FN_MAP: dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = {
+     "kl_div": kl_div_loss,
+     "rkl": reverse_kl_div_loss,
+@@ -424,6 +610,10 @@ _LOSS_FN_MAP: dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] =
+     "tv": tv_loss_fused_or_eager,
+     "nla": nla_loss_fused_or_eager,
+     "lk_hybrid": lk_hybrid_loss,
++    "opd": opd_loss,
++    "opd_first_error": opd_first_error_loss,
++    "opd_accept_reward": opd_accept_reward_loss,
++    "eal_exact": _eal_exact_guard,
+ }
+ 
+ 
+@@ -431,7 +621,8 @@ def resolve_loss_config(spec: str) -> LossConfig:
+     """Parse a loss spec into ``{name: (loss_fn, weight)}``.
+ 
+     Accepts either a plain loss name (``"kl_div"``) or a JSON dict mapping
+-    loss names to weights (``'{"ce": 0.1, "tv": 0.9}'``).
++    loss names to weights (``'{"ce": 0.1, "tv": 0.9}'``).  The ``opd``
++    variants are acceptance-aware offline surrogates for draft OPD pilots.
+     """
+     if spec in _LOSS_FN_MAP:
+         return {spec: (_LOSS_FN_MAP[spec], 1.0)}
+diff --git a/src/speculators/models/mtp/core.py b/src/speculators/models/mtp/core.py
+index bdec246..7dca0eb 100644
+--- a/src/speculators/models/mtp/core.py
++++ b/src/speculators/models/mtp/core.py
+@@ -1,10 +1,12 @@
+ """MTP speculator model implementation."""
+ 
+ import logging
++import os
+ from typing import Any, ClassVar
+ 
+ import torch
+ from torch import nn
++from torch.utils.checkpoint import checkpoint
+ from transformers import PretrainedConfig
+ from transformers.masking_utils import create_causal_mask
+ 
+@@ -25,6 +27,74 @@ __all__ = ["MTPDraftModel", "compute_step_weights"]
+ 
+ _IGNORE_INDEX = -100
+ 
++_DENSE_MOE_CHUNK = 512
++
++
++def _dense_experts_forward(self, hidden_states, top_k_index, top_k_weights):
++    """Dense chunked expert GEMMs on the fused weights.
++
++    The stock implementation loops over 256 experts and scatter-adds each
++    expert's output, which is latency-bound (~3.8 s/step at 5k tokens).
++    Computing all experts densely costs 32x the routed FLOPs but runs as a
++    handful of large GEMMs; non-selected experts are zero-weighted.
++    """
++    total_tokens, hidden_dim = hidden_states.shape
++    num_experts = self.num_experts
++    intermediate = self.intermediate_dim
++    routing = hidden_states.new_zeros((total_tokens, num_experts))
++    routing.scatter_(1, top_k_index, top_k_weights.to(hidden_states.dtype))
++    gate_up_w = self.gate_up_proj.reshape(
++        num_experts * 2 * intermediate, hidden_dim
++    ).t()
++    down_w = self.down_proj.transpose(1, 2)
++    use_ckpt = self.training and torch.is_grad_enabled()
++    outs = []
++    for start in range(0, total_tokens, _DENSE_MOE_CHUNK):
++        chunk_h = hidden_states[start : start + _DENSE_MOE_CHUNK]
++        chunk_w = routing[start : start + _DENSE_MOE_CHUNK]
++
++        def _chunk(hh, ww, gate_up_w=gate_up_w, down_w=down_w):
++            gu = torch.matmul(hh, gate_up_w).view(
++                hh.shape[0], num_experts, 2 * intermediate
++            )
++            gate, up = gu.chunk(2, dim=-1)
++            act = self.act_fn(gate) * up
++            act = act * ww.unsqueeze(-1)
++            y = torch.bmm(act.permute(1, 0, 2), down_w)
++            return y.sum(dim=0)
++
++        if use_ckpt:
++            outs.append(
++                checkpoint(
++                    _chunk,
++                    chunk_h,
++                    chunk_w,
++                    use_reentrant=False,
++                    preserve_rng_state=False,
++                )
++            )
++        else:
++            outs.append(_chunk(chunk_h, chunk_w))
++    return torch.cat(outs, dim=0)
++
++
++def _maybe_patch_dense_moe() -> None:
++    if os.environ.get("MTP_DENSE_MOE") != "1":
++        return
++    try:
++        from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as modeling
++    except ImportError:
++        return
++    cls = modeling.Qwen3_5MoeExperts
++    if getattr(cls, "_dense_moe_patched", False):
++        return
++    cls.forward = _dense_experts_forward
++    cls._dense_moe_patched = True
++    logger.info("MTP dense MoE forward enabled")
++
++
++_maybe_patch_dense_moe()
++
+ 
+ def compute_step_weights(beta: float = 0.6, num_steps: int = 3) -> list[float]:
+     """Compute normalized exponential-decay step weights.
+@@ -185,37 +255,61 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
+         )
+ 
+         current_hidden = hidden_states
++        use_ckpt = self.training and torch.is_grad_enabled()
+         for step in range(effective_steps):
+             step_hidden = current_hidden[:, :valid_len]
+             step_embeds = self.embed_tokens(
+                 input_ids[:, step + 1 : step + 1 + valid_len]
+             )
+             step_pos_emb = self.rotary_emb(step_hidden, step_pos_ids)
+-
+-            mtp_output = self.mtp_layers[0](
+-                hidden_states=step_hidden,
+-                token_embeddings=step_embeds,
+-                attention_mask=causal_mask,
+-                position_ids=step_pos_ids,
+-                position_embeddings=step_pos_emb,
+-            )
+-
+-            logits = self.lm_head(mtp_output)
+-            all_logits.append(logits)
+-
+             step_targets = input_ids[:, step + 2 : step + 2 + valid_len]
+             if loss_mask is not None:
+                 step_mask = loss_mask[:, step + 2 : step + 2 + valid_len]
+                 step_targets = step_targets.clone()
+                 step_targets[step_mask == 0] = _IGNORE_INDEX
+             weight = step_weights[step] if step_weights is not None else 1.0
+-            unreduced = nn.functional.cross_entropy(
+-                logits.permute(0, 2, 1),
+-                step_targets,
+-                ignore_index=_IGNORE_INDEX,
+-                reduction="none",
+-            )
+             valid_count = (step_targets != _IGNORE_INDEX).sum()
++
++            def _run_step(
++                hidden,
++                embeds,
++                targets=step_targets,
++                pos_ids=step_pos_ids,
++                pos_emb=step_pos_emb,
++                mask=causal_mask,
++            ):
++                out = self.mtp_layers[0](
++                    hidden_states=hidden,
++                    token_embeddings=embeds,
++                    attention_mask=mask,
++                    position_ids=pos_ids,
++                    position_embeddings=pos_emb,
++                )
++                return out, self.lm_head(out)
++
++            mtp_output, logits = _run_step(step_hidden, step_embeds)
++            if not use_ckpt:
++                all_logits.append(logits)
++
++            def _ce(lg, targets=step_targets):
++                # [1, T, V] with V contiguous -> standard [N, V] CE fast path.
++                # Permuting to [1, V, T] selects the slow spatial softmax kernel.
++                return nn.functional.cross_entropy(
++                    lg.reshape(-1, lg.shape[-1]),
++                    targets.reshape(-1),
++                    ignore_index=_IGNORE_INDEX,
++                    reduction="none",
++                )
++
++            if use_ckpt:
++                # Recompute the fp32 log-softmax during backward instead of
++                # retaining a [seq_len, vocab] fp32 buffer for every step.
++                unreduced = checkpoint(
++                    _ce, logits, use_reentrant=False, preserve_rng_state=False
++                )
++            else:
++                unreduced = _ce(logits)
++
+             step_loss = weight * unreduced.sum() / valid_count.clamp(min=1)
+             total_loss = total_loss + step_loss
+             metrics[f"loss_step_{step}"] = step_loss.detach().clone()
+diff --git a/src/speculators/train/config/schema.py b/src/speculators/train/config/schema.py
+index 9257e52..c9f273a 100644
+--- a/src/speculators/train/config/schema.py
++++ b/src/speculators/train/config/schema.py
+@@ -314,6 +314,11 @@ class LossArgs(_Group):
+         description="Multiplicative loss weight decay applied per TTT step "
+         "(1.0 = weight every step equally).",
+     )
++    eal_kl_coef: float = Field(
++        default=0.0,
++        description="Forward-KL anchor coefficient for the eal_exact loss "
++        "(0.0 = pure EAL objective, >0 adds a KL drift anchor).",
++    )
+ 
+     @field_validator("loss_fn")
+     @classmethod
+diff --git a/src/speculators/train/dataloader.py b/src/speculators/train/dataloader.py
+index 2de0647..ca30d21 100644
+--- a/src/speculators/train/dataloader.py
++++ b/src/speculators/train/dataloader.py
+@@ -12,6 +12,17 @@ import os
+ import torch
+ from torch.utils.data import DataLoader
+ 
++class _SkipBatchSampler:
++    def __init__(self, base, skip: int):
++        self.base, self.skip = base, skip
++    def __iter__(self):
++        it = iter(self.base)
++        for _ in range(self.skip):
++            next(it)
++        yield from it
++    def __len__(self):
++        return max(0, len(self.base) - self.skip)
++
+ from speculators._vendor.hs_connectors import HiddenStatesTransfer
+ from speculators.train.data import (
+     ArrowDataset,
+@@ -60,6 +71,7 @@ def _setup_dataloader(
+     num_target_layers: int = 3,
+     prefetch_factor: int | None = 4,
+     preprocess: Callable[[BatchType], BatchType] | None = None,
++    batch_skip: int = 0,
+ ) -> DataLoader:
+     batch_sampler = MultipackDistributedBatchSamplerV2(
+         batch_max_length=total_seq_len,
+@@ -68,6 +80,8 @@ def _setup_dataloader(
+         rank=get_dp_rank(),
+     )
+     use_workers = num_workers > 0
++    if batch_skip:
++        batch_sampler = _SkipBatchSampler(batch_sampler, batch_skip)
+     return DataLoader(
+         dataset,
+         batch_sampler=batch_sampler,
+@@ -107,6 +121,7 @@ def create_train_val_loaders(
+     prefetch_factor: int,
+     preprocess: Callable[[BatchType], BatchType] | None,
+     train_data_ratio: float = 0.9,
++    train_batch_skip: int = 0,
+ ) -> tuple[DataLoader, DataLoader]:
+     """Create training and validation DataLoaders.
+ 
+@@ -178,6 +193,7 @@ def create_train_val_loaders(
+         num_workers=num_workers,
+         prefetch_factor=prefetch_factor,
+         preprocess=preprocess,
++        batch_skip=train_batch_skip,
+     )
+     val_loader = _setup_dataloader(
+         val_dataset,
+diff --git a/src/speculators/train/trainer.py b/src/speculators/train/trainer.py
+index a342b45..77f824a 100644
+--- a/src/speculators/train/trainer.py
++++ b/src/speculators/train/trainer.py
+@@ -1,5 +1,6 @@
+ import json
+ import logging
++import os
+ import time
+ import warnings
+ from pathlib import Path
+@@ -40,6 +41,19 @@ root_logger = logging.getLogger("speculators")
+ metric_logger = logging.getLogger("speculators.metrics")
+ 
+ 
++def _mem_dbg(tag: str) -> None:
++    if not os.environ.get("SPEC_DEBUG_MEM"):
++        return
++    torch.cuda.synchronize()
++    gib = 1024**3
++    print(
++        f"[mem] {tag}: alloc={torch.cuda.memory_allocated()/gib:.2f} "
++        f"reserved={torch.cuda.memory_reserved()/gib:.2f} "
++        f"peak={torch.cuda.max_memory_allocated()/gib:.2f}",
++        flush=True,
++    )
++
++
+ class _StepTimer:
+     # Each mark()/now() forces an accelerator.synchronize to capture true GPU time.
+     # This serialises the CUDA pipeline, so profiled steps are slower; keep
+@@ -190,7 +204,9 @@ class Trainer:
+ 
+         self.setup_trainer()
+         self.setup_model()
++        _mem_dbg("after_setup_model")
+         self.setup_optimizer()
++        _mem_dbg("after_setup_optimizer")
+ 
+     def _training_state_path(self, epoch: int) -> Path:
+         return self.checkpointer.path / str(epoch) / "training_state.json"
+@@ -443,7 +459,24 @@ class Trainer:
+         )
+         t_before_fetch = time.perf_counter()
+         timer = _StepTimer()
++        profiler = None
++        profiler_steps = 0
++        profiler_done = False
++        profile_n = int(os.environ.get("SPEC_PROFILE", "0"))
++        profile_after = int(os.environ.get("SPEC_PROFILE_AFTER", "0"))
+         for local_step_rel, batch in enumerate(train_loader, 1):
++            if (
++                profile_n > 0
++                and not profiler_done
++                and profiler is None
++                and local_step_rel > profile_after
++            ):
++                from torch.profiler import ProfilerActivity, profile
++
++                profiler = profile(
++                    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
++                )
++                profiler.start()
+             # local_step is 1-based index into the *full* epoch (not the slice).
+             local_step = local_step_rel + skip_steps
+             timer.reset(self.global_step % self.config.log_freq == 0)
+@@ -463,14 +496,31 @@ class Trainer:
+                 _draft_tokens, loss, metrics = self.model(
+                     **gpu_batch, **(self.config.train_call_kwargs or {})
+                 )
++            _mem_dbg(f"after_forward step={self.global_step}")
+ 
+             timer.mark("fwd")
+             self._optimizers_zero_grad()
+             loss.backward()
+             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
++            _mem_dbg(f"after_backward step={self.global_step}")
+ 
+             timer.mark("bwd")
+             self._optimizers_step()
++            _mem_dbg(f"after_optim_step step={self.global_step}")
++
++            if profiler is not None:
++                profiler.step()
++                profiler_steps += 1
++                if profiler_steps >= profile_n:
++                    profiler.stop()
++                    print(
++                        profiler.key_averages().table(
++                            sort_by="cuda_time_total", row_limit=30
++                        ),
++                        flush=True,
++                    )
++                    profiler = None
++                    profiler_done = True
+ 
+             current_lrs = {
+                 type(opt).__name__: opt.param_groups[0]["lr"] for opt in self.optimizers
