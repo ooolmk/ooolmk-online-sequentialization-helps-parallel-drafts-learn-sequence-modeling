@@ -1,0 +1,19 @@
+{
+  "input": "open_perfectblend_1trun_v2",
+  "output": "open_perfectblend_1trun_v2_300k",
+  "input_rows": 1420909,
+  "output_rows": 300000,
+  "sample_size": 300000,
+  "seed": 42,
+  "source_counts": {
+    "HuggingFaceH4/ultrafeedback_binarized": 26600,
+    "HuggingFaceH4/orca-math-word-problems-200k": 42125,
+    "openbmb/UltraInteract_sft": 57364,
+    "meta-math/MetaMathQA": 81212,
+    "theblackcat102/evol-codealpaca-v1": 23427,
+    "Post-training-Data-Flywheel/AutoIF-instruct-61k": 12978,
+    "mlabonne/ultrachat_200k_sft": 44122,
+    "mlabonne/lmsys-arena-human-preference-55k-sharegpt": 12172
+  },
+  "output_file": "open_perfectblend_1trun_v2_300k/data/train-*-of-00012.parquet"
+}
